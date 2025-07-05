@@ -18,9 +18,9 @@ images:
   dir_ptrn: "*"     # images would be looked for at <base_path>/<dir_ptrn>
   selection:        # filename at <base_path> containing list of image filenames (one per line)
 model_name:         # model_name: for example resnet50, vgg16, vit_base_patch16_224, etc...
-creator_name: lsc      
+creator_name: sloc      
 creator_args:
-  lsc:              # lsc parameters
+  sloc:              # sloc parameters
 results_path:       # results (explanations) base path. would be saved at <results_path>/<model_name>/saliency/<explanation_name>/<image_name>
 ```
 

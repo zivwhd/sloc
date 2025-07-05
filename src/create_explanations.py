@@ -4,7 +4,7 @@ import torch
 import yaml
 import models
 import dataset
-import lsc
+import sloc
 import argparse
 
 def save_saliency(results_path, obj, model_name, variant, image_name):
@@ -61,12 +61,9 @@ def validate_cfg(cfg, path=[]):
 
 ### creators 
 
-def get_lsc_explanation_creator(**kwargs):
-    return lsc.LSCExplanationCreator(**kwargs)
+def get_sloc_explanation_creator(**kwargs):
+    return sloc.AutoProbSlocExplanationCreator(**kwargs)
 
-def get_dix_cnn_explanation_creator(**kwargs):
-    from adaptors import dix_cnn
-    return dix_cnn.DixCnnSaliencyCreator(**kwargs)
 
 ########################
 
