@@ -698,6 +698,36 @@ class SlocExplanationCreator:
         return sal
 
 
+class ProbSqMaskGen(SqMaskGen):
+
+    def gen_masks(self, nmasks):        
+        probs = self.prob[0:nmasks]
+        self.prob = self.prob[nmasks:]
+        indexes = torch.arange(nmasks)
+        
+        all_masks = []
+        all_indexes = []
+        total_masks = 0
+        while total_masks < nmasks:
+            #print("@@@", probs)
+            remaining_masks = (nmasks - total_masks)
+            masks = (self.gen_masks_cont(remaining_masks) < probs.unsqueeze(1).unsqueeze(1) )
+            is_valid = (masks.flatten(start_dim=1).sum(dim=1) > 0)
+            num_valid = int(is_valid.sum())
+            if num_valid == 0:
+                continue
+            valid_masks = masks[is_valid]
+            all_masks.append(valid_masks)
+            all_indexes.append(indexes[is_valid])
+            indexes = indexes[~is_valid]
+            probs = probs[~is_valid]
+            total_masks += num_valid
+            #print("done", total_masks)
+        masks = torch.concat(all_masks)
+        act_indexes = torch.concat(all_indexes)
+        _, restore_indices = act_indexes.sort()
+        return masks[restore_indices]
+
 class AutoProbSlocExplanationCreator:
 
     def __init__(self, nmasks=[500,500], segsize=[32, 56], **kwargs):
@@ -714,23 +744,43 @@ class AutoProbSlocExplanationCreator:
         algo = SlocExplanationCreator(nmasks=self.nmasks, segsize=self.segsize,  pprob=pprob, **self.kwargs)
         return algo(me, inp, catidx)
 
-    def get_prob_score(self, pprob, segsize, me, inp, catidx, sampsize=50):        
-        algo = SlocExplanationCreator(desc="gen", segsize=segsize, nmasks=sampsize, pprob=pprob)    
-        data = algo.generate_data(me, inp, catidx)         
-        rv = float(data.all_pred.std().cpu())
-        return rv
+    def get_prob_score_list(self, pprob, segsize, me, inp, catidx, sampsize=50):
+        prob_list = []
+        for x in pprob:
+            prob_list += ([x] * sampsize)
 
-    def tune_pprob(self, segsize, me, inp, catidx):
+        mgen = ProbSqMaskGen(segsize=segsize, mshape=me.shape, prob=torch.Tensor(prob_list))
+        algo = SlocExplanationCreator(
+            desc="gen", segsize=[segsize], nmasks=[sampsize*len(pprob)], mgen=mgen,
+            pprob=[torch.Tensor(prob_list)], batch_size=len(prob_list))    
+        data = algo.generate_data(me, inp, catidx)  
+
+        rv = []
+        for idx, prob in enumerate(pprob):
+            score = float(data.all_pred[(idx*sampsize):((idx+1)*sampsize)].std().cpu())
+            rv.append(score)
+        return torch.Tensor(rv)
+
+    def tune_pprob(self, segsize, me, inp, catidx, single_pass=True):
         logging.info(f"tune_pprob: {segsize}")        
         pscore = lambda x: self.get_prob_score(x, segsize, me, inp, catidx)
         main_probs = [0.3, 0.4, 0.5, 0.6, 0.7]
-        main_scores = torch.tensor([pscore(x) for x in main_probs])
-        foc = main_probs[int(main_scores.argmax())]
         extra_probs = [0.2, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.8]
-        aux_probs = [x for x in extra_probs if (foc - 0.15 <= x <= foc + 0.15)]    
-        aux_scores = torch.Tensor([pscore(x) for x in aux_probs])
-        all_probs = torch.Tensor(main_probs + aux_probs)
-        all_scores = torch.concat([main_scores, aux_scores])
+
+        if single_pass: 
+            main_probs += extra_probs
+
+        main_scores = self.get_prob_score_list(main_probs, segsize, me, inp, catidx)        
+        
+        if single_pass:
+            all_probs = torch.Tensor(main_probs)
+            all_scores = main_scores
+        else:
+            foc = main_probs[int(main_scores.argmax())]
+            aux_probs = [x for x in extra_probs if (foc - 0.15 <= x <= foc + 0.15)]    
+            aux_scores = self.get_prob_score_list(aux_probs, segsize, me, inp, catidx)
+            all_probs = torch.Tensor(main_probs + aux_probs)
+            all_scores = torch.concat([main_scores, aux_scores])
 
         rv = float(all_probs[int(all_scores.argmax())])
         return rv
@@ -756,6 +806,61 @@ class ModelProbSlocExplanationCreator:
             assert False, f"Unexpected arch {me.arch}"
         algo = SlocExplanationCreator(nmasks=self.nmasks, segsize=self.segsize, pprob=pprob, **self.kwargs)
         return algo(me, inp, catidx)
+
+
+class AggSlocExplanationCreator(AutoProbSlocExplanationCreator):
+
+    def __init__(self, mode=["mean"], seq=False, **kwargs):
+        super().__init__(**kwargs)
+        self.mode = mode
+        self.seq = seq
+
+    def flatten(self, items):
+        rv = []
+        for x in items:
+            if type(x) in [list, set]:
+                rv += self.flatten(x)
+            else:
+                rv.append(x)
+        return rv
+
+    def __call__(self, me, inp, catidx):
+        all_segsize = list(set(self.flatten(self.segsize)))
+        pprob_dict = { segsize : self.tune_pprob(segsize, me, inp, catidx, single_pass=self.tune_single_pass) 
+                      for segsize in all_segsize }
+        res = {}
+        exp_list = []
+        desc = None
+        for idx, segsize in enumerate(self.segsize):
+
+            pprob = [pprob_dict[x] for x in segsize]
+            c_positive = False # (self.mode == "mul")
+            algo = SlocExplanationCreator(
+                nmasks=self.nmasks, segsize=segsize, 
+                cap_response=self.cap_response, pprob=pprob, c_positive=c_positive, **self.kwargs)        
+            desc = (desc or algo.description())
+
+            cexp = algo.explain(me,inp, catidx).cpu().unsqueeze(0)
+            if self.mode == "prod":
+                cexp = torch.maximum(cexp, torch.zeros(1))
+            exp_list.append(cexp)
+            
+            for mode in self.mode:
+                if mode in ["mean", "median","min"]:
+                    stacked = torch.stack(exp_list, dim=0)
+                    if mode == "median":
+                        exp, _ = torch.median(stacked, dim=0) 
+                    elif mode =="mean":
+                        exp = torch.mean(stacked, dim=0)
+                    elif mode == "min":
+                        exp, _ = torch.min(stacked, dim=0)
+                elif mode == "prod":
+                    exp = exp_list[0]
+                    for cexp in exp_list[1:]:
+                        exp = exp * cexp * (exp > 0) * (cexp > 0)
+                res[f"{desc}_{mode}_{idx+1}"] = exp
+
+        return res
 
 def SLOC_explain(me, inp, label, **kwargs):
     algo = AutoProbSlocExplanationCreator(**kwargs)
